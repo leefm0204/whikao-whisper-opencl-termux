@@ -1,0 +1,290 @@
+name: Build whisper.cpp OpenCL for Termux
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_ref:
+        description: "whisper.cpp branch, tag, or commit"
+        required: true
+        default: "master"
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - ".github/workflows/build-whisper-opencl-android.yml"
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: whisper-opencl-android-arm64
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: "27.2.12479018"
+  ANDROID_API: "28"
+  OPENCL_VERSION: "v2026.05.29"
+
+jobs:
+  build:
+    name: Android arm64 / OpenCL 2.0 / Adreno
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out whisper.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ github.event.inputs.whisper_ref || 'master' }}
+          path: whisper.cpp
+          fetch-depth: 1
+
+      - name: Patch ggml OpenCL lazy initialization regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("whisper.cpp/ggml/src/ggml-opencl/ggml-opencl.cpp")
+          source = path.read_text()
+
+          old_alignment = """static size_t ggml_backend_opencl_buffer_type_get_alignment(ggml_backend_buffer_type_t buffer_type) {
+              ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
+              return dev_ctx->backend_ctx->alignment;
+          }"""
+          new_alignment = """static size_t ggml_backend_opencl_buffer_type_get_alignment(ggml_backend_buffer_type_t buffer_type) {
+              ggml_backend_opencl_context * backend_ctx = ggml_cl_init(buffer_type->device);
+              return backend_ctx->alignment;
+          }"""
+
+          old_max_size = """static size_t ggml_backend_opencl_buffer_type_get_max_size(ggml_backend_buffer_type_t buffer_type) {
+              static size_t max_size = -1;
+              if (max_size == (size_t)-1) {
+                  ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
+                  max_size = dev_ctx->backend_ctx->max_alloc_size;
+              }
+              return max_size;
+          }"""
+          new_max_size = """static size_t ggml_backend_opencl_buffer_type_get_max_size(ggml_backend_buffer_type_t buffer_type) {
+              static size_t max_size = -1;
+              if (max_size == (size_t)-1) {
+                  ggml_backend_opencl_context * backend_ctx = ggml_cl_init(buffer_type->device);
+                  max_size = backend_ctx->max_alloc_size;
+              }
+              return max_size;
+          }"""
+
+          changed = False
+          for old, new in ((old_alignment, new_alignment), (old_max_size, new_max_size)):
+              if old in source:
+                  source = source.replace(old, new, 1)
+                  changed = True
+              elif new not in source:
+                  raise SystemExit("OpenCL source changed: regression patch no longer matches")
+
+          if changed:
+              path.write_text(source)
+              print("Applied whisper.cpp OpenCL lazy-init regression patch")
+          else:
+              print("OpenCL lazy-init regression is already fixed upstream")
+          PY
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install host tools and Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build patchelf
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Fetch OpenCL build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${OPENCL_VERSION}" \
+            https://github.com/KhronosGroup/OpenCL-Headers.git OpenCL-Headers
+          git clone --depth 1 --branch "${OPENCL_VERSION}" \
+            https://github.com/KhronosGroup/OpenCL-ICD-Loader.git OpenCL-ICD-Loader
+
+      - name: Build link-time OpenCL library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S OpenCL-ICD-Loader -B build-opencl -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DOPENCL_ICD_LOADER_HEADERS_DIR="$GITHUB_WORKSPACE/OpenCL-Headers" \
+            -DENABLE_OPENCL_LAYERS=OFF \
+            -DENABLE_OPENCL_LAYERINFO=OFF \
+            -DOPENCL_ICD_LOADER_BUILD_TESTING=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/opencl-stage"
+          cmake --build build-opencl --parallel
+          cmake --install build-opencl
+
+      - name: Configure whisper.cpp for Redmi K90 Pro Max
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S whisper.cpp -B build-whisper -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL=c++_static \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_SERVER=OFF \
+            -DWHISPER_CURL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_CPU_ARM_ARCH=armv9.2-a+dotprod+fp16+i8mm+sve2+sme \
+            -DGGML_OPENCL=ON \
+            -DGGML_OPENCL_TARGET_VERSION=200 \
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=ON \
+            -DGGML_OPENCL_EMBED_KERNELS=ON \
+            -DOpenCL_INCLUDE_DIR="$GITHUB_WORKSPACE/OpenCL-Headers" \
+            -DOpenCL_LIBRARY="$GITHUB_WORKSPACE/opencl-stage/lib/libOpenCL.so"
+
+      - name: Build whisper-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build-whisper --target whisper-cli --parallel
+          test -x build-whisper/bin/whisper-cli
+
+      - name: Package for Termux
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$GITHUB_WORKSPACE/package/whisper-opencl-android-arm64"
+          mkdir -p "$package/bin"
+          cp build-whisper/bin/whisper-cli "$package/bin/"
+
+          if patchelf --print-needed "$package/bin/whisper-cli" | grep -qx 'libOpenCL.so.1'; then
+            patchelf --replace-needed libOpenCL.so.1 libOpenCL.so "$package/bin/whisper-cli"
+          fi
+          patchelf --print-needed "$package/bin/whisper-cli" | tee "$package/NEEDED.txt"
+          if ! grep -qx 'libOpenCL.so' "$package/NEEDED.txt"; then
+            echo "Expected a direct libOpenCL.so dependency, but none was found" >&2
+            exit 1
+          fi
+
+          cat > "$package/whisper-opencl" <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+          set -euo pipefail
+          : "${PREFIX:=/data/data/com.termux/files/usr}"
+          script="$(readlink -f "${BASH_SOURCE[0]}")"
+          root="$(cd "$(dirname "$script")" && pwd)"
+          vendor_dir="${PREFIX}/opt/vendor/lib"
+          if [[ ! -s "${vendor_dir}/libOpenCL.so" ]]; then
+            echo "未找到 ${vendor_dir}/libOpenCL.so" >&2
+            echo "请先执行: pkg install patchelf opencl-vendor-driver" >&2
+            echo "然后执行: pkg reinstall opencl-vendor-driver" >&2
+            exit 1
+          fi
+          export LD_LIBRARY_PATH="${vendor_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          exec "${root}/bin/whisper-cli" "$@"
+          EOF
+
+          cat > "$package/install.sh" <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+          set -euo pipefail
+          : "${PREFIX:=/data/data/com.termux/files/usr}"
+          src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          dest="${PREFIX}/opt/whisper-opencl"
+
+          pkg install -y patchelf
+          pkg install -y opencl-vendor-driver
+          if [[ ! -s "${PREFIX}/opt/vendor/lib/libOpenCL.so" ]]; then
+            pkg reinstall -y opencl-vendor-driver
+          fi
+          if [[ ! -s "${PREFIX}/opt/vendor/lib/libOpenCL.so" ]]; then
+            echo "没有检测到厂商 OpenCL 驱动。请确认 /vendor/lib64/libOpenCL.so 存在。" >&2
+            exit 1
+          fi
+
+          mkdir -p "$dest/bin"
+          install -m 755 "$src/bin/whisper-cli" "$dest/bin/whisper-cli"
+          install -m 755 "$src/whisper-opencl" "$dest/whisper-opencl"
+          ln -sfn "$dest/whisper-opencl" "${PREFIX}/bin/whisper-opencl"
+          echo "安装完成: whisper-opencl"
+          echo "模型下载示例: bash $src/download-model.sh base"
+          EOF
+
+          cat > "$package/download-model.sh" <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+          set -euo pipefail
+          model="${1:-base}"
+          out_dir="${2:-${HOME}/models}"
+          mkdir -p "$out_dir"
+          url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${model}.bin"
+          file="${out_dir}/ggml-${model}.bin"
+          command -v curl >/dev/null || pkg install -y curl
+          curl --fail --location --continue-at - --output "$file" "$url"
+          echo "$file"
+          EOF
+
+          cat > "$package/README.txt" <<'EOF'
+          Redmi K90 Pro Max / Termux / whisper.cpp OpenCL
+
+          1. 在 Termux 中解压下载的 tar.gz：
+             tar -xzf whisper-opencl-android-arm64-*.tar.gz
+             cd whisper-opencl-android-arm64
+
+          2. 安装：
+             bash install.sh
+
+          3. 下载中文多语言模型（base 较快，small 更准）：
+             bash download-model.sh base
+             # 或: bash download-model.sh small
+
+          4. 把音频转为 16 kHz 单声道 WAV：
+             pkg install ffmpeg
+             ffmpeg -i input.m4a -ar 16000 -ac 1 -c:a pcm_s16le input.wav
+
+          5. 中文转写：
+             whisper-opencl -m ~/models/ggml-base.bin -f input.wav -l zh -otxt -osrt -t 8
+
+          检查 OpenCL：运行转写时，日志应出现 OpenCL/Adreno 设备信息。
+          Qualcomm 驱动不提供标准 ICD 扩展，所以 clinfo 显示 0 个平台并不能单独证明本包失败。
+
+          若提示找不到 libOpenCL.so：
+             ls -l /vendor/lib64/libOpenCL.so
+             OVERRIDE_LIBOPENCL=/vendor/lib64/libOpenCL.so pkg reinstall opencl-vendor-driver
+
+          若 ROM/系统升级，请重新执行：
+             pkg reinstall opencl-vendor-driver
+          EOF
+
+          chmod 755 "$package/whisper-opencl" "$package/install.sh" "$package/download-model.sh"
+          printf 'whisper.cpp commit: %s\n' "$(git -C whisper.cpp rev-parse HEAD)" > "$package/BUILD-INFO.txt"
+          printf 'Android ABI: arm64-v8a\nAndroid API: %s\nOpenCL target: 2.0\nCPU arch: armv9.2-a+dotprod+fp16+i8mm+sve2+sme\n' \
+            "$ANDROID_API" >> "$package/BUILD-INFO.txt"
+          tar -C "$GITHUB_WORKSPACE/package" -czf \
+            "$GITHUB_WORKSPACE/whisper-opencl-android-arm64-${GITHUB_RUN_NUMBER}.tar.gz" \
+            whisper-opencl-android-arm64
+          sha256sum whisper-opencl-android-arm64-*.tar.gz > SHA256SUMS.txt
+
+      - name: Upload Termux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-opencl-android-arm64-${{ github.run_number }}
+          path: |
+            whisper-opencl-android-arm64-*.tar.gz
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
