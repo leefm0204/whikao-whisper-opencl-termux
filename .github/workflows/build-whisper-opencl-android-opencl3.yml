@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NDK_VERSION: "27.2.12479018"
+  NDK_VERSION: "r28b"
   ANDROID_API: "28"
   OPENCL_VERSION: "v2026.05.29"
 
