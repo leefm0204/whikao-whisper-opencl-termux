@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Check out whisper.cpp
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ggml-org/whisper.cpp
           ref: ${{ github.event.inputs.whisper_ref || 'master' }}
