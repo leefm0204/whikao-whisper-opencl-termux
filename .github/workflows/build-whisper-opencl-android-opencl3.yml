@@ -93,9 +93,17 @@ jobs:
           else:
               print("OpenCL lazy-init regression is already fixed upstream")
           PY
+    
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+         ndk-version: 'r28b'
+         add-to-path: true
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Set up environment variables
+        run: |
+         echo "ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
 
       - name: Install host tools and Android NDK
         shell: bash
@@ -103,9 +111,6 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ninja-build patchelf
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "ndk;${NDK_VERSION}"
-          echo "ANDROID_NDK=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Fetch OpenCL build dependencies
         shell: bash
